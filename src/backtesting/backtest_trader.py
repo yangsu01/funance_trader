@@ -1,10 +1,10 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from scipy.stats import gmean
-from typing import Tuple, List, Dict
+from typing import Dict, Optional
 
 from ..trading_rules import TradingRule
+from ..trading_rules.indicators import EWMA
 
 class BacktestTrader:
     def __init__(
@@ -14,6 +14,8 @@ class BacktestTrader:
         cash: float=10000.0,
         commission: float=0.0,
         fee_type: str='percent',
+        volatility_target: Optional[float]=None,
+        vol_window: int=36
     ):  
         """Initializes a BacktestTrader object
 
@@ -23,7 +25,8 @@ class BacktestTrader:
             cash (float, optional): starting trading capital. Defaults to 10000.0.
             commission (float, optional): commission fee charged per trade. Defaults to 0.0.
             fee_type (str, optional): type of fee. 'percent' or 'flat'. Defaults to 'percent'.
-
+            volatility_target (float, optional): Annualized target volatility of portfolio. Defaults to 0.20.
+            
         Raises:
             ValueError: fee_type must be either 'percent' or 'flat'
         """
@@ -35,17 +38,26 @@ class BacktestTrader:
         self.cash = cash
         self.commission = commission
         self.commission_type = fee_type
+        self.vol_target = volatility_target
         self.cash_history = pd.Series(dtype=float)
         self.value_history = pd.Series(dtype=float)
         self.trade_history = pd.DataFrame(
             index=pd.to_datetime([]),
             columns=['ticker', 'action', 'price', 'size']
         )
+        self.instrument_returns = pd.DataFrame(
+            index=pd.to_datetime([]),
+            columns=self.data.columns.get_level_values('Ticker').unique()
+        )
         self.order = None
         self.positions = {
-            x: 0 for x in self.data.columns.get_level_values('ticker').unique()
+            x: 0 for x in self.data.columns.get_level_values('Ticker').unique()
         }
         self.timestamp = None
+        self.vol_ewma = EWMA(vol_window)
+        self.last_price = None
+        self.enough_data = False
+    
     
     def _log(self, message: str, timestamp: datetime=None):
         """Logs a message with a timestamp
@@ -59,8 +71,14 @@ class BacktestTrader:
     
     
     def _submit_order(self, positions: Dict[str, int], log: bool):
+        """Records an order to be executed
+
+        Args:
+            positions (Dict[str, int]): dictionary of ticker and how many units to buy/sell
+            log (bool): whether to log the order
+        """
         self.order = positions
-        
+
         if log:
             self._log(
                 f'Order submitted.'
@@ -68,6 +86,15 @@ class BacktestTrader:
             
     
     def _calculate_fee(self, price: float, size: int) -> float:
+        """Calculates the fee for a trade
+
+        Args:
+            price (float): price of the trade
+            size (int): number of units traded
+
+        Returns:
+            float: fee for the trade
+        """
         if self.commission_type == 'percent':
             return np.abs(self.commission*price*size)
         else:
@@ -75,17 +102,26 @@ class BacktestTrader:
     
     
     def _record_trade(self, ticker: str, action: str, price: float, size: int):
-        self.trade_history = self.trade_history.loc[self.timestamp] = [
-            {
-                'ticker': ticker,
-                'action': action,
-                'price': price,
-                'size': size
-            },
-        ]
+        """Records a trade
+
+        Args:
+            ticker (str): ticker of the trade
+            action (str): action of the trade
+            price (float): price of the trade
+            size (int): number of units traded
+        """
+        self.trade_history.loc[self.timestamp] = [ticker, action, price, size]
     
     
     def _execute_trade(self, order: dict, prices: pd.Series, log: bool):
+        """Executes a trade
+
+        Args:
+            order (dict): dictionary of ticker and how many units to buy/sell
+            prices (pd.Series): prices of the trade
+            log (bool): whether to log the trade
+
+        """
         for ticker, size in order.items():
             price = prices[ticker]
             
@@ -138,17 +174,74 @@ class BacktestTrader:
 
     
     def _update_history(self, prices: pd.Series):
+        """Updates the history of the trader
+
+        Args:
+            prices (pd.Series): prices of the trade
+        """
         # cash
         self.cash_history[self.timestamp] = self.cash
-        
+
         # portfolio value
         value = self.cash + sum(
             prices.loc[x] * self.positions[x] for x in self.positions.keys()
         )
         self.value_history[self.timestamp] = value
+        
+    
+    def _forecasts_to_positions(self, forecasts: Dict[str, float], prices: pd.Series) -> Dict[str, int]:
+        """Generates a position based on scaled forecasts and position size based on volatility targeting
+        
+        Args:
+            forecasts (Dict[str, float]): dictionary of ticker and scaled forecasts
+            prices (pd.Series): current prices for each ticker
+            
+        Returns:
+            Dict[str, int]: dictionary of ticker and number of shares to buy/sell to reach target positions
+        """
+        target_positions = self.positions.copy()
+
+        if self.last_price is not None:
+            # calculate current portfolio value
+            current_value = self.cash + sum(
+                self.data.loc[self.timestamp, ('Close', ticker)] * self.positions[ticker] 
+                for ticker in self.positions.keys()
+            )
+            
+            for ticker in forecasts.keys():
+                # log returns for current day
+                returns = np.log(prices[ticker] / self.last_price[ticker])
+                self.instrument_returns.loc[self.timestamp, ticker] = returns
+                # update rolling variance estimate
+                price_var = self.vol_ewma.update(returns**2, self.timestamp) 
+                # convert to volatility and set minimum
+                price_vol = max(np.sqrt(price_var), 0.001)
+
+                # if volatility target is provided, calculate position size to achieve target volatility
+                if self.vol_target is not None:
+                    position_size = (self.vol_target / np.sqrt(252)) * (current_value / (price_vol * prices[ticker]))
+                    target_positions[ticker] = int(position_size * forecasts[ticker])
+                else:
+                    if forecasts[ticker] < 0:
+                        target_positions[ticker] = -self.positions[ticker]  # sell all
+                    elif forecasts[ticker] > 0:
+                        target_positions[ticker] = int(self.cash / prices[ticker])  # buy all
+
+        shares_to_trade = {
+            ticker: target_positions[ticker] - self.positions[ticker]
+            for ticker in target_positions.keys()
+        }
+        # update last price
+        self.last_price = prices
+        return shares_to_trade
     
     
     def run_backtest(self, log: bool=False):
+        """Runs a backtest
+
+        Args:
+            log (bool, optional): whether to log the backtest. Defaults to False.
+        """
         if log:
             self._log(
                 f'Backtesting... \n'
@@ -160,7 +253,7 @@ class BacktestTrader:
             bar = self.data.iloc[i]
             
             # check to resolve any open orders
-            if self.order is not None:
+            if self.order is not None:      
                 self._execute_trade(
                     self.order,
                     bar['Open'],
@@ -168,7 +261,8 @@ class BacktestTrader:
                 )
             
             # get position from trading rule
-            positions = self.rule.generate_positions(bar)
+            forecasts = self.rule.generate_next_forecast(bar)
+            positions = self._forecasts_to_positions(forecasts, bar['Close'])
             
             # submit order if non zero positions
             if any(position !=0 for position in positions.values()):
@@ -176,19 +270,18 @@ class BacktestTrader:
                     positions,
                     log
                 )
-            
+                # set enough data to true after first non zero forecast
+                self.enough_data = True
+
             # update history
-            self._update_history(bar['Close'])
+            if self.enough_data:
+                self._update_history(bar['Close'])
         
         if log:
             self._log(
-                f'Ending Value: ${self.value_history.iloc[-1]} \n'
+                f'Ending Value: ${self.value_history.iloc[-1]} \n' if len(self.value_history) > 0 else 'No trades were made. \n'
                 f'Backtest complete. \n'
             )
-            
-    
-    def run_bootstrap(self):
-        pass
     
     
     def plot_backtest(self):
@@ -199,9 +292,10 @@ class BacktestTrader:
         pass
     
     
-    def plot_bootstrap(self):
-        pass
-    
-    
     def get_analysis(self) -> Dict:
-        pass
+        return {
+            'cash_history': self.cash_history,
+            'value_history': self.value_history,
+            'trade_history': self.trade_history,
+            'instrument_returns': self.instrument_returns
+        }
