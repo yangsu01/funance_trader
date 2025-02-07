@@ -1,5 +1,4 @@
 asttokens==3.0.0
-backtrader==1.9.78.123
 beautifulsoup4==4.12.3
 certifi==2024.12.14
 charset-normalizer==3.4.1
@@ -43,6 +42,7 @@ pytz==2024.2
 pywin32==308
 pyzmq==26.2.1
 requests==2.32.3
+scipy==1.15.1
 six==1.17.0
 soupsieve==2.6
 stack-data==0.6.3
