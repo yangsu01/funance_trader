@@ -2,9 +2,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from typing import Dict, Optional
+from matplotlib import pyplot as plt
 
 from ..trading_rules import TradingRule
 from ..trading_rules.indicators import EWMA
+from ..utils import calculate_returns
 
 class BacktestTrader:
     def __init__(
@@ -15,7 +17,7 @@ class BacktestTrader:
         commission: float=0.0,
         fee_type: str='percent',
         volatility_target: Optional[float]=None,
-        vol_window: int=36
+        vol_window: int=35
     ):  
         """Initializes a BacktestTrader object
 
@@ -26,6 +28,7 @@ class BacktestTrader:
             commission (float, optional): commission fee charged per trade. Defaults to 0.0.
             fee_type (str, optional): type of fee. 'percent' or 'flat'. Defaults to 'percent'.
             volatility_target (float, optional): Annualized target volatility of portfolio. Defaults to 0.20.
+            vol_window (int, optional): Window size for volatility calculation. Defaults to 35.
             
         Raises:
             ValueError: fee_type must be either 'percent' or 'flat'
@@ -38,12 +41,13 @@ class BacktestTrader:
         self.cash = cash
         self.commission = commission
         self.commission_type = fee_type
-        self.vol_target = volatility_target
+        # Convert annual volatility target to daily
+        self.vol_target = None if volatility_target is None else volatility_target/np.sqrt(252)
         self.cash_history = pd.Series(dtype=float)
         self.value_history = pd.Series(dtype=float)
         self.trade_history = pd.DataFrame(
             index=pd.to_datetime([]),
-            columns=['ticker', 'action', 'price', 'size']
+            columns=['ticker', 'action', 'price', 'size', 'fee', 'profit_loss']
         )
         self.instrument_returns = pd.DataFrame(
             index=pd.to_datetime([]),
@@ -53,11 +57,16 @@ class BacktestTrader:
         self.positions = {
             x: 0 for x in self.data.columns.get_level_values('Ticker').unique()
         }
+        self.average_prices = {
+            x: 0 for x in self.data.columns.get_level_values('Ticker').unique()
+        }
         self.timestamp = None
-        self.vol_ewma = EWMA(vol_window)
+        self.vol_ewma = {
+            ticker: EWMA(vol_window) for ticker in self.data.columns.get_level_values('Ticker').unique()
+        }
         self.last_price = None
         self.enough_data = False
-    
+
     
     def _log(self, message: str, timestamp: datetime=None):
         """Logs a message with a timestamp
@@ -80,8 +89,12 @@ class BacktestTrader:
         self.order = positions
 
         if log:
+            message = []
+            for ticker, size in self.order.items():
+                action = "buy" if size > 0 else "sell"
+                message.append(f"{action} {abs(size)} shares of {ticker}")
             self._log(
-                f'Order submitted.'
+                f'Order submitted: {", ".join(message)}'
             )
             
     
@@ -101,7 +114,15 @@ class BacktestTrader:
             return self.commission
     
     
-    def _record_trade(self, ticker: str, action: str, price: float, size: int):
+    def _record_trade(
+        self,
+        ticker: str,
+        action: str,
+        price: float,
+        size: int,
+        fee: float,
+        profit_loss: float=0
+    ):
         """Records a trade
 
         Args:
@@ -109,8 +130,17 @@ class BacktestTrader:
             action (str): action of the trade
             price (float): price of the trade
             size (int): number of units traded
+            fee (float): fee of the trade
+            profit_loss (float, optional): profit or loss of the trade. Defaults to None for buys.
         """
-        self.trade_history.loc[self.timestamp] = [ticker, action, price, size]
+        self.trade_history.loc[self.timestamp] = [
+            ticker,
+            action,
+            np.round(price, 2),
+            size,
+            np.round(fee, 2),
+            np.round(profit_loss, 2)
+        ]
     
     
     def _execute_trade(self, order: dict, prices: pd.Series, log: bool):
@@ -127,12 +157,11 @@ class BacktestTrader:
             
             # buy transaction
             if size > 0:
-                    
                 # calculate affordable amount
                 if self.commission_type == 'percent':
                     max_size = int(self.cash/(price * (1+self.commission)))
                 else:
-                    max_size = int(self.cash/(price + self.commission))
+                    max_size = int((self.cash - self.commission)/price)
                 
                 fill_size = min(max_size, size)
                 
@@ -143,14 +172,18 @@ class BacktestTrader:
                     # log trade
                     if log:
                         self._log(
-                            f'Bought {fill_size}/{size} of {ticker} at ${price}, '
-                            f'commission: ${fee}'
+                            f'Bought {fill_size}/{size} of {ticker} at ${np.round(price, 2)}, '
+                            f'commission: ${np.round(fee, 2)}'
                         )
                     
-                    # update update records
+                    # update cash, average price, and positions
                     self.cash -= fill_size * price + fee
+                    self.average_prices[ticker] = (
+                        (self.average_prices[ticker]*self.positions[ticker] + fill_size*price) / (self.positions[ticker] + fill_size)
+                    )
                     self.positions[ticker] += fill_size
-                    self._record_trade(ticker, 'buy', price, fill_size)
+                    
+                    self._record_trade(ticker, 'buy', price, fill_size, fee)
                 
             # sell transaction
             elif size < 0:
@@ -163,14 +196,15 @@ class BacktestTrader:
                     # log trade
                     if log:
                         self._log(
-                            f'Sold {fill_size}/{self.positions[ticker]} of held {ticker} at ${price}, '
-                            f'commission: ${fee}'
+                            f'Sold {fill_size}/{self.positions[ticker]} of held {ticker} at ${np.round(price, 2)}, '
+                            f'commission: ${np.round(fee, 2)}'
                         )
                     
                     # update records
                     self.cash += fill_size * price - fee
                     self.positions[ticker] -= fill_size
-                    self._record_trade(ticker, 'sell', price, fill_size)
+                    profit_loss = fill_size * (price - self.average_prices[ticker])
+                    self._record_trade(ticker, 'sell', price, fill_size, fee, profit_loss)
 
     
     def _update_history(self, prices: pd.Series):
@@ -189,57 +223,73 @@ class BacktestTrader:
         self.value_history[self.timestamp] = value
         
     
-    def _forecasts_to_positions(self, forecasts: Dict[str, float], prices: pd.Series) -> Dict[str, int]:
+    def _forecasts_to_positions(self, forecasts: Dict[str, float], prices: pd.Series, position_margin: float) -> Dict[str, int]:
         """Generates a position based on scaled forecasts and position size based on volatility targeting
         
         Args:
-            forecasts (Dict[str, float]): dictionary of ticker and scaled forecasts
+            forecasts (Dict[str, float]): dictionary of ticker and scaled forecasts (-20 to +20)
             prices (pd.Series): current prices for each ticker
+            position_margin (float): minimum position change threshold as fraction of current position
             
         Returns:
             Dict[str, int]: dictionary of ticker and number of shares to buy/sell to reach target positions
         """
-        target_positions = self.positions.copy()
+        positions_to_trade = {ticker: 0 for ticker in forecasts.keys()}
+        portfolio_value = self.cash + sum(
+            prices.loc[x] * self.positions[x] for x in self.positions.keys()
+        )
 
         if self.last_price is not None:
-            # calculate current portfolio value
-            current_value = self.cash + sum(
-                self.data.loc[self.timestamp, ('Close', ticker)] * self.positions[ticker] 
-                for ticker in self.positions.keys()
-            )
-            
             for ticker in forecasts.keys():
-                # log returns for current day
+                # Calculate % price volatility using log returns
                 returns = np.log(prices[ticker] / self.last_price[ticker])
                 self.instrument_returns.loc[self.timestamp, ticker] = returns
-                # update rolling variance estimate
-                price_var = self.vol_ewma.update(returns**2, self.timestamp) 
-                # convert to volatility and set minimum
-                price_vol = max(np.sqrt(price_var), 0.001)
+                price_var = self.vol_ewma[ticker].update(returns**2, self.timestamp)
+                price_vol = max(np.sqrt(price_var), 0.001)  # Minimum vol floor
 
-                # if volatility target is provided, calculate position size to achieve target volatility
+                # Position sizing based on volatility targeting
                 if self.vol_target is not None:
-                    position_size = (self.vol_target / np.sqrt(252)) * (current_value / (price_vol * prices[ticker]))
-                    target_positions[ticker] = int(position_size * forecasts[ticker])
-                else:
-                    if forecasts[ticker] < 0:
-                        target_positions[ticker] = -self.positions[ticker]  # sell all
-                    elif forecasts[ticker] > 0:
-                        target_positions[ticker] = int(self.cash / prices[ticker])  # buy all
+                    # Calculate instrument currency volatility 
+                    instrument_cash_vol = price_vol * prices[ticker]
+                    
+                    # Calculate position multiplier based on target risk
+                    # Position multiplier = target risk / instrument risk
+                    # Where target risk = portfolio value * target vol
+                    # And instrument risk = price * price vol
+                    position_multiplier = (portfolio_value * self.vol_target) / instrument_cash_vol
+                    
+                    # Scale forecast from -20 to +20 range to actual position
+                    # Forecast of 10 = 100% of base position
+                    target_position = int(position_multiplier * (forecasts[ticker] / 10))
 
-        shares_to_trade = {
-            ticker: target_positions[ticker] - self.positions[ticker]
-            for ticker in target_positions.keys()
-        }
-        # update last price
+                else:
+                    # Simple long/short without volatility targeting
+                    if forecasts[ticker] < 0:
+                        target_position = 0  # sell all
+                    elif forecasts[ticker] > 0:
+                        target_position = int(self.cash / prices[ticker]) + self.positions[ticker]  # buy all
+                    else:
+                        target_position = self.positions[ticker]  # hold
+                
+                # Calculate position change needed
+                position_adjustment = target_position - self.positions[ticker]
+                adjustment_size = np.abs(position_margin * self.positions[ticker])
+
+                # Only trade if adjustment exceeds minimum size
+                if np.abs(position_adjustment) > adjustment_size:
+                    positions_to_trade[ticker] = position_adjustment
+
+        # Store prices for next volatility calculation
         self.last_price = prices
-        return shares_to_trade
+        return positions_to_trade
     
     
-    def run_backtest(self, log: bool=False):
+    def run_backtest(self, position_margin: float=0.0, log: bool=False):
         """Runs a backtest
 
         Args:
+            position_margin (float, optional): current position will not be adjusted 
+                if the trade size is less than position_margin * current position. Defaults to 0.0.
             log (bool, optional): whether to log the backtest. Defaults to False.
         """
         if log:
@@ -259,13 +309,14 @@ class BacktestTrader:
                     bar['Open'],
                     log
                 )
+                self.order = None
             
             # get position from trading rule
             forecasts = self.rule.generate_next_forecast(bar)
-            positions = self._forecasts_to_positions(forecasts, bar['Close'])
+            positions = self._forecasts_to_positions(forecasts, bar['Close'], position_margin)
             
             # submit order if non zero positions
-            if any(position !=0 for position in positions.values()):
+            if any(position != 0 for position in positions.values()):
                 self._submit_order(
                     positions,
                     log
@@ -285,17 +336,73 @@ class BacktestTrader:
     
     
     def plot_backtest(self):
-        pass
-    
-    
-    def plot_forecasts(self):
-        pass
+        _, axs = plt.subplots(
+            4,
+            sharex=True,
+            gridspec_kw={'height_ratios': [1, 1, 2, 1]},
+            figsize=(16, 16)
+        )
+        plt.subplots_adjust(hspace=0.05) # adjust vertical gap
+        start_date = self.value_history.index[0]
+        
+        # forecasts 
+        forecasts = self.rule.get_forecasts()
+        axs[0].plot(forecasts)
+        axs[0].axhline(y=0, color='black', linestyle='--', label='Hold')
+        axs[0].axhline(y=20, color='g', linestyle='--', label='Strong Buy')
+        axs[0].axhline(y=-20, color='r', linestyle='--', label='Strong Sell')
+        
+        axs[0].set_ylabel('Scaled Forecast')
+        axs[0].legend(loc='upper left')
+        
+        # trades
+        trades = self.trade_history[self.trade_history['action'] == 'sell']
+        colors = np.where(
+            trades['profit_loss'] >= 0,
+            'g',
+            'r'
+        )
+        axs[1].scatter(
+            trades.index,
+            trades['profit_loss'],
+            s=10,
+            color=colors
+        )
+        
+        axs[1].set_ylabel('Profit / Loss')
+        
+        # instrument price and indicators
+        indicators = self.rule.get_plot_data()
+        axs[2].plot(self.data['Close'].loc[start_date:], label='Asset Price')
+        for key, val in indicators.items():
+            axs[2].plot(val.loc[start_date:], label=key)
+        
+        axs[2].set_ylabel('Price')
+        axs[2].legend(loc='upper left')
+
+        # cash and value
+        axs[3].plot(self.cash_history, label='Cash')
+        axs[3].plot(self.value_history, label='Portfolio Value')
+        
+        axs[3].set_ylabel('Value')
+        axs[3].legend(loc='upper left')
+        
+        # title
+        asset_returns = calculate_returns(self.data['Close'].loc[start_date:])['annual'][0]
+        strategy_returns = calculate_returns(self.value_history)['annual']
+        plt.suptitle(
+            'Backtest Results \n' + 
+            f'Annual Asset Returns: {asset_returns*100}% \n' +
+            f'Annual Backtest Returns: {strategy_returns*100}%',
+            fontsize=24
+        )
+
+        plt.show()
     
     
     def get_analysis(self) -> Dict:
         return {
             'cash_history': self.cash_history,
             'value_history': self.value_history,
-            'trade_history': self.trade_history,
-            'instrument_returns': self.instrument_returns
+            'trade_history': self.trade_history
         }
