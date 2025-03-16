@@ -28,6 +28,16 @@ class TradingRule(ABC):
             pd.Series: series of forecasts
         """
         raise NotImplementedError
+    
+    
+    @abstractmethod
+    def get_plot_data(self) -> dict:
+        """Returns historical data for plotting
+
+        Returns:
+            dict: dictionary of historical data
+        """
+        raise NotImplementedError
 
     
 
