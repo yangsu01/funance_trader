@@ -13,8 +13,8 @@ class BacktestTrader:
         self,
         rule: TradingRule,
         data: pd.DataFrame,
-        cash: float=10000.0,
-        commission: float=0.0,
+        cash: Optional[float]=10000.0,
+        commission: Optional[float]=0.0,
         fee_type: str='percent',
         volatility_target: Optional[float]=None,
         vol_window: int=35
@@ -284,7 +284,7 @@ class BacktestTrader:
         return positions_to_trade
     
     
-    def run_backtest(self, position_margin: float=0.0, log: bool=False):
+    def run(self, position_margin: float=0.0, log: bool=False):
         """Runs a backtest
 
         Args:
@@ -335,24 +335,24 @@ class BacktestTrader:
             )
     
     
-    def plot_backtest(self):
+    def plot(self):
         _, axs = plt.subplots(
             4,
             sharex=True,
-            gridspec_kw={'height_ratios': [1, 1, 2, 1]},
+            gridspec_kw={'height_ratios': [3, 1, 3, 1]},
             figsize=(16, 16)
         )
         plt.subplots_adjust(hspace=0.05) # adjust vertical gap
         start_date = self.value_history.index[0]
+        asset_prices = self.data['Close'].loc[start_date:]
         
-        # forecasts 
-        forecasts = self.rule.get_forecasts()
-        axs[0].plot(forecasts)
-        axs[0].axhline(y=0, color='black', linestyle='--', label='Hold')
-        axs[0].axhline(y=20, color='g', linestyle='--', label='Strong Buy')
-        axs[0].axhline(y=-20, color='r', linestyle='--', label='Strong Sell')
+        # instrument price and indicators
+        indicators = self.rule.get_plot_data()
+        axs[0].plot(asset_prices, label='Asset Price')
+        for key, val in indicators.items():
+            axs[0].plot(val.loc[start_date:], label=key)
         
-        axs[0].set_ylabel('Scaled Forecast')
+        axs[0].set_ylabel('Price')
         axs[0].legend(loc='upper left')
         
         # trades
@@ -371,13 +371,13 @@ class BacktestTrader:
         
         axs[1].set_ylabel('Profit / Loss')
         
-        # instrument price and indicators
-        indicators = self.rule.get_plot_data()
-        axs[2].plot(self.data['Close'].loc[start_date:], label='Asset Price')
-        for key, val in indicators.items():
-            axs[2].plot(val.loc[start_date:], label=key)
+        # cumulative returns
+        cum_asset_ret = asset_prices/asset_prices.iloc[0] - 1
+        cum_strategy_ret = self.value_history/self.value_history.iloc[0] - 1
+        axs[2].plot(cum_asset_ret, label='Asset Returns')
+        axs[2].plot(cum_strategy_ret, label='Strategy Returns')
         
-        axs[2].set_ylabel('Price')
+        axs[2].set_ylabel('Cumulative Returns')
         axs[2].legend(loc='upper left')
 
         # cash and value
@@ -388,19 +388,19 @@ class BacktestTrader:
         axs[3].legend(loc='upper left')
         
         # title
-        asset_returns = calculate_returns(self.data['Close'].loc[start_date:])['annual'][0]
+        asset_returns = calculate_returns(asset_prices)['annual'][0] # TODO fix this for multiple assets
         strategy_returns = calculate_returns(self.value_history)['annual']
         plt.suptitle(
             'Backtest Results \n' + 
-            f'Annual Asset Returns: {asset_returns*100}% \n' +
-            f'Annual Backtest Returns: {strategy_returns*100}%',
+            f'Annual Asset Returns: {asset_returns*100: .2f}% \n' +
+            f'Annual Backtest Returns: {strategy_returns*100: .2f}%',
             fontsize=24
         )
 
         plt.show()
     
     
-    def get_analysis(self) -> Dict:
+    def analysis(self) -> Dict:
         return {
             'cash_history': self.cash_history,
             'value_history': self.value_history,
