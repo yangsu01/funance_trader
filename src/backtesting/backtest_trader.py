@@ -17,8 +17,10 @@ class BacktestTrader:
         commission: Optional[float]=0.0,
         fee_type: str='percent',
         volatility_target: Optional[float]=None,
-        vol_window: int=35
-    ):  
+        position_margin: float=0.0,
+        vol_window: int=35,
+        log: bool=False
+    ) -> None:  
         """Initializes a BacktestTrader object
 
         Args:
@@ -28,7 +30,9 @@ class BacktestTrader:
             commission (float, optional): commission fee charged per trade. Defaults to 0.0.
             fee_type (str, optional): type of fee. 'percent' or 'flat'. Defaults to 'percent'.
             volatility_target (float, optional): Annualized target volatility of portfolio. Defaults to 0.20.
+            position_margin (float, optional): min position change threshold as fraction shares held. Defaults to 0.0.
             vol_window (int, optional): Window size for volatility calculation. Defaults to 35.
+            log (bool, optional): whether to log the backtest. Defaults to False.
             
         Raises:
             ValueError: fee_type must be either 'percent' or 'flat'
@@ -43,6 +47,8 @@ class BacktestTrader:
         self.commission_type = fee_type
         # Convert annual volatility target to daily
         self.vol_target = None if volatility_target is None else volatility_target/np.sqrt(252)
+        self.log = log
+        self.position_margin = position_margin
         self.cash_history = pd.Series(dtype=float)
         self.value_history = pd.Series(dtype=float)
         self.trade_history = pd.DataFrame(
@@ -68,7 +74,7 @@ class BacktestTrader:
         self.enough_data = False
 
     
-    def _log(self, message: str, timestamp: datetime=None):
+    def _log(self, message: str, timestamp: datetime=None) -> None:
         """Logs a message with a timestamp
 
         Args:
@@ -79,16 +85,15 @@ class BacktestTrader:
         print(f'{ts}: {message}')
     
     
-    def _submit_order(self, positions: Dict[str, int], log: bool):
+    def _submit_order(self, positions: Dict[str, int]) -> None:
         """Records an order to be executed
 
         Args:
             positions (Dict[str, int]): dictionary of ticker and how many units to buy/sell
-            log (bool): whether to log the order
         """
         self.order = positions
 
-        if log:
+        if self.log:
             message = []
             for ticker, size in self.order.items():
                 action = "buy" if size > 0 else "sell"
@@ -122,7 +127,7 @@ class BacktestTrader:
         size: int,
         fee: float,
         profit_loss: float=0
-    ):
+    ) -> None:
         """Records a trade
 
         Args:
@@ -143,14 +148,12 @@ class BacktestTrader:
         ]
     
     
-    def _execute_trade(self, order: dict, prices: pd.Series, log: bool):
+    def _execute_trade(self, order: dict, prices: pd.Series):
         """Executes a trade
 
         Args:
             order (dict): dictionary of ticker and how many units to buy/sell
             prices (pd.Series): prices of the trade
-            log (bool): whether to log the trade
-
         """
         for ticker, size in order.items():
             price = prices[ticker]
@@ -170,7 +173,7 @@ class BacktestTrader:
                     fee = self._calculate_fee(price, fill_size)
                     
                     # log trade
-                    if log:
+                    if self.log:
                         self._log(
                             f'Bought {fill_size}/{size} of {ticker} at ${np.round(price, 2)}, '
                             f'commission: ${np.round(fee, 2)}'
@@ -194,7 +197,7 @@ class BacktestTrader:
                     fee = self._calculate_fee(price, fill_size)
                     
                     # log trade
-                    if log:
+                    if self.log:
                         self._log(
                             f'Sold {fill_size}/{self.positions[ticker]} of held {ticker} at ${np.round(price, 2)}, '
                             f'commission: ${np.round(fee, 2)}'
@@ -207,7 +210,7 @@ class BacktestTrader:
                     self._record_trade(ticker, 'sell', price, fill_size, fee, profit_loss)
 
     
-    def _update_history(self, prices: pd.Series):
+    def _update_history(self, prices: pd.Series) -> None:
         """Updates the history of the trader
 
         Args:
@@ -223,13 +226,16 @@ class BacktestTrader:
         self.value_history[self.timestamp] = value
         
     
-    def _forecasts_to_positions(self, forecasts: Dict[str, float], prices: pd.Series, position_margin: float) -> Dict[str, int]:
+    def _forecasts_to_positions(
+        self,
+        forecasts: Dict[str, float],
+        prices: pd.Series
+    ) -> Dict[str, int]:
         """Generates a position based on scaled forecasts and position size based on volatility targeting
         
         Args:
             forecasts (Dict[str, float]): dictionary of ticker and scaled forecasts (-20 to +20)
             prices (pd.Series): current prices for each ticker
-            position_margin (float): minimum position change threshold as fraction of current position
             
         Returns:
             Dict[str, int]: dictionary of ticker and number of shares to buy/sell to reach target positions
@@ -273,7 +279,7 @@ class BacktestTrader:
                 
                 # Calculate position change needed
                 position_adjustment = target_position - self.positions[ticker]
-                adjustment_size = np.abs(position_margin * self.positions[ticker])
+                adjustment_size = np.abs(self.position_margin * self.positions[ticker])
 
                 # Only trade if adjustment exceeds minimum size
                 if np.abs(position_adjustment) > adjustment_size:
@@ -284,15 +290,10 @@ class BacktestTrader:
         return positions_to_trade
     
     
-    def run(self, position_margin: float=0.0, log: bool=False):
-        """Runs a backtest
-
-        Args:
-            position_margin (float, optional): current position will not be adjusted 
-                if the trade size is less than position_margin * current position. Defaults to 0.0.
-            log (bool, optional): whether to log the backtest. Defaults to False.
+    def run(self) -> None:
+        """Runs a backtest of the trading rule on the data provided
         """
-        if log:
+        if self.log:
             self._log(
                 f'Backtesting... \n'
                 f'Starting Value: ${self.cash}'
@@ -307,19 +308,17 @@ class BacktestTrader:
                 self._execute_trade(
                     self.order,
                     bar['Open'],
-                    log
                 )
                 self.order = None
             
             # get position from trading rule
             forecasts = self.rule.generate_next_forecast(bar)
-            positions = self._forecasts_to_positions(forecasts, bar['Close'], position_margin)
+            positions = self._forecasts_to_positions(forecasts, bar['Close'])
             
             # submit order if non zero positions
             if any(position != 0 for position in positions.values()):
                 self._submit_order(
                     positions,
-                    log
                 )
                 # set enough data to true after first non zero forecast
                 self.enough_data = True
@@ -328,14 +327,16 @@ class BacktestTrader:
             if self.enough_data:
                 self._update_history(bar['Close'])
         
-        if log:
+        if self.log:
             self._log(
                 f'Ending Value: ${self.value_history.iloc[-1]} \n' if len(self.value_history) > 0 else 'No trades were made. \n'
                 f'Backtest complete. \n'
             )
     
     
-    def plot(self):
+    def plot(self) -> None:
+        """Plots the backtest results
+        """
         _, axs = plt.subplots(
             4,
             sharex=True,
@@ -400,7 +401,12 @@ class BacktestTrader:
         plt.show()
     
     
-    def analysis(self) -> Dict:
+    def analysis(self) -> Dict[str, pd.DataFrame]:
+        """Gets raw analysis data from the backtest
+
+        Returns:
+            Dict[str, pd.DataFrame]: dictionary of analysis data
+        """
         return {
             'cash_history': self.cash_history,
             'value_history': self.value_history,
